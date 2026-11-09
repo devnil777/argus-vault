@@ -49,6 +49,7 @@ def test_noop_diff_maps_to_exit6(job):
     assert conftest.run_cli(["diff", job.dir]) == 6
 
 
+@pytest.mark.skipif(conftest.RAR_PATH is None, reason="Rar.exe not found")
 def test_full_without_config_is_exit5(tmp_path):
     job_dir = tmp_path / "job"
     job_dir.mkdir()                      # no config.yaml inside
