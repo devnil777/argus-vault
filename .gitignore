@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.zcode/
+*.egg-info/
+*.spec
+
+task.md
+AGENTS.md
+DIAGNOSTICS.md
+
+# RARLAB proprietary files (separate license)
+Rar.exe
+Rar-en.exe
+RarLng.dll
+Rar.txt
+
+# Local notes
+DIAGNOSTICS.md

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backuper"
+# Keep in sync with backuper/__init__.py (__version__) — updated manually.
+version = "0.2.0"
+description = "RAR-based backup tool with self-describing full/diff epoch chains (Windows)."
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6",
+    "cryptography>=42",
+]
+
+[project.scripts]
+backuper = "backuper.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "pyinstaller",
+]
+
+[tool.setuptools]
+packages = ["backuper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+# SIM105: try/except/pass is intentional best-effort cleanup around ctypes and temp dirs;
+# SIM115: lock fds and long-lived scan handles must not be context-managed away.
+ignore = ["SIM105", "SIM115"]
