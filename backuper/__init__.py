@@ -3,4 +3,4 @@
 Full/diff backup chains driven by self-describing RAR archives.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.0.1"

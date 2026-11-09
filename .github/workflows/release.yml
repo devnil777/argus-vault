@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: "Explicit version override (empty = use bump)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: Bump version
+        id: bump
+        shell: pwsh
+        run: |
+          if ("${{ inputs.version }}" -ne "") {
+            $out = python scripts/bump_version.py --set "${{ inputs.version }}"
+          } else {
+            $out = python scripts/bump_version.py --part "${{ inputs.bump }}"
+          }
+          $target = ($out | Select-Object -First 1).ToString().Trim()
+          if ([string]::IsNullOrWhiteSpace($target)) { throw "bump produced no version" }
+          if (git rev-parse "refs/tags/v$target" 2>$null) { throw "tag v$target already exists" }
+          "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "target=$target"
+
+      - name: Build exe
+        run: cmd /c build_exe.bat
+
+      - name: Verify exe version
+        shell: pwsh
+        run: |
+          $out = & .\dist\backuper.exe --version
+          Write-Host $out
+          $target = "${{ steps.bump.outputs.target }}"
+          if ($out -notmatch "backuper $([regex]::Escape($target))") {
+            throw "exe version mismatch: $out (expected $target)"
+          }
+
+      - name: Install pandoc
+        run: choco install pandoc --no-progress -y
+
+      - name: Stage release assets
+        id: package
+        shell: pwsh
+        run: |
+          $target = "${{ steps.bump.outputs.target }}"
+          $zip = "argus-vault-v$target-win64.zip"
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          pandoc README.md -f gfm -t html5 --standalone --embed-resources `
+            --css scripts/readme.css --template scripts/readme-template.html `
+            --variable pagetitle="argus-vault v$target" -o release\README.html
+          Copy-Item dist\backuper.exe release\backuper.exe
+          Copy-Item LICENSE release\LICENSE
+          Compress-Archive -Path release\* -DestinationPath $zip -Force
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "zip=$zip"
+
+      - name: Create sha256
+        shell: pwsh
+        run: |
+          $zip = "${{ steps.package.outputs.zip }}"
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          $name = Split-Path $zip -Leaf
+          [System.IO.File]::WriteAllText("$zip.sha256", "$hash *$name`n", [System.Text.Encoding]::ASCII)
+          Write-Host (Get-Content "$zip.sha256")
+
+      - name: Commit, tag and push
+        shell: pwsh
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $target = "${{ steps.bump.outputs.target }}"
+          $token = $env:RELEASE_TOKEN
+          if ([string]::IsNullOrWhiteSpace($token)) { $token = $env:GITHUB_TOKEN }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backuper/__init__.py
+          if (git diff --cached --quiet) {
+            Write-Host "No version file changes; tagging current HEAD"
+          } else {
+            git commit -m "chore(release): v$target"
+          }
+          git tag -a "v$target" -m "Release v$target"
+          $remote = "https://x-access-token:$token@github.com/${{ github.repository }}.git"
+          git remote set-url origin $remote
+          git push --atomic origin HEAD:main "v$target"
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $target = "${{ steps.bump.outputs.target }}"
+          $zip = "${{ steps.package.outputs.zip }}"
+          gh release create "v$target" --title "v$target" --generate-notes $zip "$zip.sha256"

@@ -526,7 +526,9 @@ def test_extract_password_walks_up_to_job_dir(
     archive.write_bytes(b"x")
 
     assert runner.extract_archive_password(
-        archive, recipient_private_key_path=str(tmp_path / RECIPIENT_PRIVATE_NAME)) == crypto.password_for_rar(dek)
+        archive,
+        recipient_private_key_path=str(tmp_path / RECIPIENT_PRIVATE_NAME),
+    ) == crypto.password_for_rar(dek)
     assert capsys.readouterr().out == ""
 
 

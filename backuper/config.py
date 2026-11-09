@@ -320,13 +320,13 @@ def _build_config(data: object, path: Path, raw: bytes) -> Config:
     # travels via the manifest, so a missing signing file on the embedded
     # path is not an error.
     embedded = (Path(path).name == "<embedded config>")
-    if recipient_value is not None and signing_public_pem is None and not embedded:
+    if (recipient_value is not None and signing_public_pem is None and not embedded
+            and not sp_path.is_file()):
         # real job config: signing file must exist
-        if not sp_path.is_file():
-            raise ConfigError(
-                f"config file {path}: 'recipient_public_key' and the signing public "
-                f"key file ({SIGNING_PUBLIC_NAME}) must be set together "
-                f"(or both absent for unencrypted behaviour)")
+        raise ConfigError(
+            f"config file {path}: 'recipient_public_key' and the signing public "
+            f"key file ({SIGNING_PUBLIC_NAME}) must be set together "
+            f"(or both absent for unencrypted behaviour)")
     if recipient_value is None and signing_public_pem is not None:
         raise ConfigError(
             f"config file {path}: 'recipient_public_key' and the signing public "
