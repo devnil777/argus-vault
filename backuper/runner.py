@@ -19,7 +19,6 @@ import datetime
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import time
 import traceback
@@ -505,38 +504,6 @@ def _fingerprint(pem: bytes) -> str:
     return ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
 
 
-def _harden_private_key_acls(paths: tuple[Path, ...]) -> None:
-    """Windows-only best-effort hardening of private key files.
-
-    For each path runs
-    ``icacls <path> /inheritance:r /grant:r "<current user>":F``: ACL
-    inheritance is disabled (otherwise anything Inbox-granted to wider
-    groups would leak through) and the file is granted FULL control to
-    the current user only. ONLY the file path is handed to icacls --
-    private key material never appears in any command, output or log.
-    Failures (icacls missing, nonzero exit, OSError) print one stderr
-    warning naming the file and NEVER abort the keygen.
-    """
-    if os.name != "nt":
-        return
-    user = os.environ.get("USERNAME") or os.getlogin()
-    for path in paths:
-        try:
-            proc = subprocess.run(
-                ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
-                capture_output=True, text=True, check=False)
-        except OSError as exc:
-            print(f"warning: could not restrict permissions on {path.name}: {exc}",
-                  file=sys.stderr)
-            continue
-        if proc.returncode != 0:
-            reason = (proc.stderr or proc.stdout or "").strip()
-            if not reason:
-                reason = f"icacls exit code {proc.returncode}"
-            print(f"warning: could not restrict permissions on {path.name}: {reason}",
-                  file=sys.stderr)
-
-
 def generate_job_keys(config_path: Path, *, force: bool = False) -> tuple[str, str]:
     """The shared keygen flow of ``backuper keygen`` and ``init --generate-keys``.
 
@@ -546,10 +513,6 @@ def generate_job_keys(config_path: Path, *, force: bool = False) -> tuple[str, s
     public PEMs (also refuses to REPLACE different existing public keys
     without ``force``). Prints key ids + fingerprints to stdout and the
     lose-your-keys warning to stderr.
-
-    On Windows the two private key files also get a best-effort restrictive
-    ACL (see :func:`_harden_private_key_acls`): user-only access with ACL
-    inheritance disabled; a hardening failure only warns on stderr.
 
     NEVER prints or logs private key material. Returns the two key ids.
     """
@@ -579,8 +542,6 @@ def generate_job_keys(config_path: Path, *, force: bool = False) -> tuple[str, s
             path.write_bytes(pem)
         except OSError as exc:
             raise PreflightError(f"cannot write private key file {path}: {exc}") from exc
-
-    _harden_private_key_acls(priv_paths)
 
     print(f"recipient key: id {recipient_id}  fingerprint {_fingerprint(recipient_pub)}")
     print(f"signing   key: id {signing_id}  fingerprint {_fingerprint(signing_pub)}")

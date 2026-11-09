@@ -404,24 +404,6 @@ def test_keygen_cli_exit_codes(tmp_path, capsys):
 
 
 @needs_crypto
-def test_harden_private_key_acls_best_effort(tmp_path, capsys):
-    """Windows ACL hardening is best-effort: the helper never raises and
-    only ever reports the FILE NAME (never key material) in any warning."""
-    probes = (private_key_path(tmp_path / CONFIG_NAME, "recipient"),
-              private_key_path(tmp_path / CONFIG_NAME, "signing"))
-    for p in probes:
-        p.write_bytes(b"-----BEGIN TEST VALUE-----\n")
-
-    runner._harden_private_key_acls(probes)          # must not raise
-    captured = capsys.readouterr()
-    # warnings (if any) name the file only, never any key-material marker
-    everything = captured.out + captured.err
-    assert "BEGIN TEST VALUE" not in everything
-    for p in probes:
-        assert p.is_file()
-
-
-@needs_crypto
 def test_init_generate_keys(tmp_path, capsys):
     job = tmp_path / "job"
     src = tmp_path / "src"
