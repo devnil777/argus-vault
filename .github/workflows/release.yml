@@ -54,7 +54,8 @@ jobs:
           }
           $target = ($out | Select-Object -First 1).ToString().Trim()
           if ([string]::IsNullOrWhiteSpace($target)) { throw "bump produced no version" }
-          if (git rev-parse "refs/tags/v$target" 2>$null) { throw "tag v$target already exists" }
+          git show-ref --verify --quiet "refs/tags/v$target"
+          if ($LASTEXITCODE -eq 0) { throw "tag v$target already exists" }
           "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "target=$target"
 
