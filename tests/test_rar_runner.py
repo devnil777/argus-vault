@@ -46,6 +46,21 @@ def test_create_step_pins_work_dir_to_archive_dir(tmp_path):
     assert args[-1].startswith("@")
 
 
+def test_create_step_disables_recursion(tmp_path):
+    target = tmp_path / "epoch" / "2026-01-01_000000_full.rar.tmp"
+    target.parent.mkdir()
+    source = tmp_path / "src"
+    source.mkdir()
+    fake = FakeRunner()
+
+    res = rar_runner.create_step(
+        fake, target, source, ["emptydir"], final=True, compression=3)
+
+    assert res.ok
+    args = fake.calls[-1]
+    assert "-r-" in args, "recursion must be disabled so named dirs are stored empty"
+
+
 def test_create_step_non_final_still_pins_work_dir(tmp_path):
     target = tmp_path / "epoch" / "2026-01-01_000000_full.rar.tmp"
     target.parent.mkdir()

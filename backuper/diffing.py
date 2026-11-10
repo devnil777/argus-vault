@@ -16,8 +16,9 @@ the same ``fn`` in the previous and current snapshot):
 5. both archived -> added iff ``sz != prev.sz or mt_ns != prev.mt_ns``
    (an mtime-only change counts; a content-only change with identical
    size and mtime is an accepted miss).
-6. in cur, not in prev -> added. Renames naturally appear as a delete
-   plus an add.
+6. in cur, not in prev -> added, UNLESS cur is skipped (a file that
+   cannot be read is in no archive yet; treat as a carried skip and
+   retry later). Renames naturally appear as a delete plus an add.
 """
 
 from __future__ import annotations
@@ -71,7 +72,8 @@ def compute_diff(prev: Snapshot, current: Snapshot) -> DiffResult:
     for fn, cur in cur_map.items():
         old = prev_map.get(fn)
         if old is None:
-            added.append(fn)                    # rule 6 (renames: half 2)
+            if not cur.skipped:                 # rule 6 (renames: half 2)
+                added.append(fn)                # new skipped -> carried skip, retry later
         elif old.skipped:
             if not cur.skipped:
                 added.append(fn)                # rule 1: re-add regardless of sz/mt

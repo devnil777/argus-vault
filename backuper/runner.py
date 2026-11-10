@@ -188,7 +188,7 @@ def _free_archive_ts(epoch_dir: Path, archive_type: str) -> str:
     name-sort before it and corrupt the filename-ordered chain that tip
     selection, list linkage and verify --chain all rely on.
     """
-    archives = sorted(p.stem for p in epoch_dir.glob("*.rar")) \
+    archives = sorted(p.stem for p in chain.epoch_archives(epoch_dir)) \
         if epoch_dir.is_dir() else []
     tip_stem = archives[-1] if archives else ""
     ts = _local_ts()
@@ -214,7 +214,10 @@ def _pick_full_epoch(job_dir: Path) -> tuple[str, Path]:
     ts = _local_ts()
     for _ in range(600):
         epoch_dir = job_dir / ts[:10]
-        if any(epoch_dir.glob("*_full.rar")):
+        # Ignore repair leftovers (fixed./rebuilt.) when detecting an
+        # existing full archive of the epoch.
+        if any(p.name.endswith("_full.rar")
+               for p in chain.epoch_archives(epoch_dir)):
             raise EpochError(
                 f"epoch {ts[:10]} already exists — delete it to start a new full epoch")
         if not any(
@@ -228,15 +231,14 @@ def _pick_full_epoch(job_dir: Path) -> tuple[str, Path]:
 def _sweep_tmp_files(*dirs: Path) -> None:
     """Best-effort deletion of stale leftovers (startup sweep).
 
-    Removes unfinished ``*.rar.tmp`` archives, stray RAR repair artifacts
-    (``fixed.*.rar`` / ``rebuilt.*.rar`` from an interrupted repair) and
-    RAR's archive-modification work files (``__rar_*.rartemp``; ``-w`` pins
-    them next to the archive and a killed run leaves one behind). None may
-    ever stay in an epoch dir, because they match the ``*.rar`` archive
-    listing and a ``rebuilt...`` name would even sort after the real
-    archives and become the tip.
+    Removes unfinished ``*.rar.tmp`` archives and RAR's archive-modification
+    work files (``__rar_*.rartemp``; ``-w`` pins them next to the archive
+    and a killed run leaves one behind). Repair leftovers (``fixed.*`` /
+    ``rebuilt.*``) are NOT deleted here: they are excluded from the chain
+    via ``chain.epoch_archives`` instead, so a user's ``fixed.*`` artifact
+    is never destroyed. ``verify --fix`` cleans its own repair leftovers.
     """
-    patterns = ("*.rar.tmp", "fixed.*.rar", "rebuilt.*.rar", "__rar_*.rartemp")
+    patterns = ("*.rar.tmp", "__rar_*.rartemp")
     for d in dirs:
         try:
             if not d.is_dir():
@@ -276,6 +278,14 @@ def _write_failed_log(
 ) -> None:
     """Write ``<ts>_<type>_failed.log`` (epoch dir when it exists, else job dir)."""
     target_dir = epoch_dir if epoch_dir is not None and epoch_dir.is_dir() else job_dir
+    # Hardening (stage 1.3): if the archive was already committed, do not
+    # write a failed-run log over it (the post-commit boundary swallows the
+    # exception instead, but this guards against unexpected escapes).
+    committed_archive = target_dir / f"{ts}_{archive_type}.rar"
+    if os.path.lexists(winapi_path(committed_archive)):
+        print(f"warning: archive {committed_archive.name} already committed; "
+              f"failed-run log suppressed", file=sys.stderr)
+        return
     lines = [
         "backuper run failed",
         "===================",
@@ -878,6 +888,64 @@ def cmd_full(job_dir: Path, rar_path: str | None, *, progress: bool = True,
 
 
 # ---------------------------------------------------------------------------
+# diff base resolution (shared by dry-run and the real run)
+# ---------------------------------------------------------------------------
+
+def _prepare_diff_base(job_dir: Path, epoch: str | None, runner: RarRunner,
+                      job_cfg: Config | None, *, sweep: bool = False):
+    '''Resolve epoch/full/tip/base/operative config for one diff run.
+
+    sweep=True runs the startup sweep inside the caller's lock context
+    BEFORE tip selection, so repair leftovers cannot become the tip.
+    '''
+    job_cfg_path = job_dir / CONFIG_NAME
+    epoch_dir = chain.resolve_epoch(job_dir, epoch)
+    if sweep:
+        _sweep_tmp_files(job_dir, epoch_dir)
+    full = chain.epoch_full(epoch_dir)
+    tip = chain.tip_archive(epoch_dir)
+    # Trust gate (see cmd_diff): job config pins the signing key for encrypted jobs.
+    if job_cfg is not None and job_cfg.encryption_enabled:
+        base = chain.check_base_archive(
+            runner, tip,
+            trusted_signing_pem=job_cfg.signing_public_pem.encode("utf-8"),
+            require_signature=True)
+    else:
+        base = chain.check_base_archive(runner, tip)
+    if job_cfg is not None:
+        warning = chain.config_mismatch_warning(
+            job_cfg, base.config_bytes,
+            embedded_signing_key_id=getattr(base.manifest, "signing_key_id", None))
+        if warning:
+            print(warning, file=sys.stderr)
+    try:
+        operative = config_from_bytes(base.config_bytes)
+    except ConfigError as exc:
+        raise EpochError(f"embedded config of {tip.name} is invalid: {exc}") from exc
+    # New format: signing key travels via the external file / job config.
+    if operative.signing_public_pem is None:
+        if job_cfg is not None and job_cfg.signing_public_pem is not None:
+            operative.signing_public_pem = job_cfg.signing_public_pem
+            if operative.signing_key_id is None:
+                operative.signing_key_id = job_cfg.signing_key_id
+        else:
+            sp = signing_public_key_path(job_cfg_path if job_cfg is not None else job_dir / CONFIG_NAME)
+            if sp.is_file():
+                try:
+                    operative.signing_public_pem = sp.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
+    if operative.signing_key_id is None and getattr(base.manifest, "signing_key_id", None) is not None:
+        operative.signing_key_id = getattr(base.manifest, "signing_key_id", None)
+    _print_config_encryption_status(operative)
+    if not base.manifest.sources:
+        raise EpochError(f"manifest of {tip.name} lists no sources")
+    source = Path(base.manifest.sources[0])
+    _preflight_layout(job_dir, source, create_job_dir=False, need_job_config=False)
+    return epoch_dir, full, tip, base, operative, source
+
+
+# ---------------------------------------------------------------------------
 # diff
 # ---------------------------------------------------------------------------
 
@@ -908,56 +976,11 @@ def cmd_diff(
             print(f"warning: job config is invalid, ignoring it ({exc}); "
                   f"the archive config is used", file=sys.stderr)
 
-    epoch_dir = chain.resolve_epoch(job_dir, epoch)
-    full = chain.epoch_full(epoch_dir)
-    tip = chain.tip_archive(epoch_dir)
-    # Trust gate: when the job config pins the encryption keys, the tip
-    # manifest's signature must verify against the job config's own signing
-    # key BEFORE anything is written -- a forged/substituted tip fails here.
-    # Legacy (unencrypted) configs keep the lenient path unchanged.
-    if job_cfg is not None and job_cfg.encryption_enabled:
-        base = chain.check_base_archive(
-            runner, tip,
-            trusted_signing_pem=job_cfg.signing_public_pem.encode("utf-8"),
-            require_signature=True)
-    else:
-        base = chain.check_base_archive(runner, tip)
-
-    if job_cfg is not None:
-        warning = chain.config_mismatch_warning(
-            job_cfg, base.config_bytes,
-            embedded_signing_key_id=getattr(base.manifest, "signing_key_id", None))
-        if warning:
-            print(warning, file=sys.stderr)
-
-    try:
-        operative = config_from_bytes(base.config_bytes)
-    except ConfigError as exc:
-        raise EpochError(f"embedded config of {tip.name} is invalid: {exc}") from exc
-    # New format: signing key travels via the external file / job config,
-    # not config.yaml. Recover it so encrypted diffs can still be signed.
-    if operative.signing_public_pem is None:
-        if job_cfg is not None and job_cfg.signing_public_pem is not None:
-            operative.signing_public_pem = job_cfg.signing_public_pem
-            if operative.signing_key_id is None:
-                operative.signing_key_id = job_cfg.signing_key_id
-        else:
-            sp = signing_public_key_path(job_cfg_path)
-            if sp.is_file():
-                try:
-                    operative.signing_public_pem = sp.read_text(encoding="utf-8").strip()
-                except OSError:
-                    pass
-    if operative.signing_key_id is None and getattr(base.manifest, "signing_key_id", None) is not None:
-        operative.signing_key_id = getattr(base.manifest, "signing_key_id", None)
-    _print_config_encryption_status(operative)
-
-    if not base.manifest.sources:
-        raise EpochError(f"manifest of {tip.name} lists no sources")
-    source = Path(base.manifest.sources[0])
-    _preflight_layout(job_dir, source, create_job_dir=False, need_job_config=False)
-
+    # Dry run and real run share the same base resolution; only the real run
+    # takes the job lock and sweeps before tip selection.
     if dry_run:
+        epoch_dir, full, tip, base, operative, source = _prepare_diff_base(
+            job_dir, epoch, runner, job_cfg, sweep=False)
         snapshot, _warnings = _scan_phase(source, operative)
         delta = diffing.compute_diff(base.snapshot, snapshot)
         if delta.is_no_op:
@@ -970,7 +993,8 @@ def cmd_diff(
     lock = JobLock(job_dir)
     lock.acquire()
     try:
-        _sweep_tmp_files(job_dir, epoch_dir)
+        epoch_dir, full, tip, base, operative, source = _prepare_diff_base(
+            job_dir, epoch, runner, job_cfg, sweep=True)
         ts = _free_archive_ts(epoch_dir, "diff")
 
         stage = "scan"
@@ -1128,6 +1152,7 @@ def cmd_verify(
     *,
     chain_mode: bool,
     fix: bool,
+    accept_new_hash: bool = False,
     rar_path: str | None,
     recipient_private_key_path: str | None = None,
 ) -> int:
@@ -1177,14 +1202,14 @@ def cmd_verify(
     try:
         if chain_mode:
             reports = verify_chain(
-                runner, epoch_dir, fix=fix,
+                runner, epoch_dir, fix=fix, accept_new_hash=accept_new_hash,
                 recipient_private_pem=recipient_private_pem,
                 trusted_signing_pem=trusted_signing_pem,
                 recipient_key_id=recipient_key_id)
         else:
             tip = chain.tip_archive(epoch_dir)
             reports = [verify_archive(
-                runner, tip, fix=fix,
+                runner, tip, fix=fix, accept_new_hash=accept_new_hash,
                 recipient_private_pem=recipient_private_pem,
                 trusted_signing_pem=trusted_signing_pem,
                 recipient_key_id=recipient_key_id)]

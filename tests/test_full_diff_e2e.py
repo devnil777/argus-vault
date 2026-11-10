@@ -4,6 +4,8 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
+import sys
 
 import conftest
 import pytest
@@ -218,3 +220,111 @@ def test_relative_job_dir_full_and_diff(tmp_path, monkeypatch):
     assert run_cli(["diff", "test"]) == 0
     assert list(epoch.glob("*_diff.rar"))
     assert run_cli(["verify", "test", "--chain"]) == 0
+
+
+def test_diff_lock_held_maps_to_exit4(job):
+    job.make_source(a="x")
+    assert run_cli(["full", job.dir]) == 0
+    (job.src / "a.txt").write_bytes(b"y")
+    lock = None
+    from backuper.lock import JobLock
+    lock = JobLock(job.dir)
+    lock.acquire()
+    try:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(conftest.PROJECT_ROOT)
+        r = subprocess.run(
+            [sys.executable, "-m", "backuper", "diff", str(job.dir)],
+            cwd=str(conftest.PROJECT_ROOT), env=env,
+            capture_output=True, text=True, timeout=300,
+        )
+        assert r.returncode == 4, r.stdout + r.stderr
+    finally:
+        lock.release()
+
+
+def test_empty_dir_with_excluded_contents_is_not_recursed(job):
+    # A directory that contains ONLY excluded entries (.tmp file, .git dir)
+    # has zero archivable files, so the scanner records it as an empty dir.
+    # RAR must store it as a folder entry only (no recursion), otherwise the
+    # excluded contents leak into the archive and break the cross-check.
+    # .git must be in exclude_dirs for the scanner to prune it (mirrors the
+    # user's real config); .tmp is already excluded by extension.
+    job.write_config(
+        f"source: {job.src.as_posix()}\n"
+        "exclude_extensions:\n  - .tmp\n"
+        "exclude_dirs:\n  - .git\n"
+        "lock_check_extensions: []\n"
+    )
+
+    d = job.src / "emptyish"
+    d.mkdir()
+    (d / "junk.tmp").write_text("tmp", encoding="utf-8")
+    git = d / ".git"
+    git.mkdir()
+    (git / "HEAD").write_text("ref: refs/heads/main", encoding="utf-8")
+
+    assert run_cli(["full", job.dir]) == 0
+
+    full = job.full_archive()
+    files, folders = stored_files(job, full)
+    # excluded contents must NOT be in the archive
+    assert "emptyish/junk.tmp" not in files
+    assert "emptyish/.git/HEAD" not in files
+    assert "emptyish/.git" not in files
+    # the dir itself is stored as an (empty) folder
+    assert "emptyish" in folders
+    # cross-check / verify must pass
+    assert run_cli(["verify", job.dir, "--chain"]) == 0
+
+
+def test_empty_dir_with_junction_is_not_recursed(job):
+    # A directory containing only a junction must be recorded as empty by the
+    # scanner (junctions are skipped) and stored by RAR as an empty folder,
+    # without following the junction into its target.
+    target = job.src / "junction_target"
+    target.mkdir()
+    (target / "secret.txt").write_text("secret", encoding="utf-8")
+
+    d = job.src / "emptyish_junction"
+    d.mkdir()
+    # create a junction (no admin required on Windows)
+    import subprocess
+    r = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(d / "link"), str(target)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"junction creation failed: {r.stderr.strip()}")
+
+    assert run_cli(["full", job.dir]) == 0
+
+    full = job.full_archive()
+    files, folders = stored_files(job, full)
+    # junction target contents must NOT leak into the archive
+    assert "emptyish_junction/link/secret.txt" not in files
+    assert "emptyish_junction/link" not in files
+    assert "emptyish_junction" in folders
+    assert run_cli(["verify", job.dir, "--chain"]) == 0
+
+
+def test_diff_new_locked_file_is_skipped_not_archived(job):
+    job.make_source(**{"a.txt": "v1"})
+    assert run_cli(["full", job.dir]) == 0
+
+    # a new .pst file that is locked during the diff must not be archived
+    # and must not fail the run.
+    job.make_source(**{"newlocked.pst": "payload"})
+    with exclusive_lock(job.src / "newlocked.pst"):
+        (job.src / "a.txt").write_bytes(b"v2 with different size")
+        rc = run_cli(["diff", job.dir])
+    assert rc == 0
+
+    diff = job.tip()
+    files, _folders = stored_files(job, diff)
+    assert "newlocked.pst" not in files
+    assert "a.txt" in files
+
+    snap = job.snapshot_of(diff)
+    fmap = snap.file_map()
+    assert fmap["newlocked.pst"].skipped is True
+    assert run_cli(["verify", job.dir, "--chain"]) == 0

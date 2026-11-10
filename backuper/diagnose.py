@@ -371,7 +371,7 @@ def check_progress(runner: RarRunner, workdir: Path) -> CheckResult:
     archive = workdir / "progress.rar"
     lst = write_list_file(workdir / "progress.lst", [str(big)])
     res = runner.run(
-        ["a", "-y", "-scflr", "-m5", str(archive), f"@{lst}"],
+        ["a", "-y", "-scflr", "-r-", "-m5", str(archive), f"@{lst}"],
         track_stdout=True, timeout=900)
     try:
         big.unlink(missing_ok=True)

@@ -1,5 +1,6 @@
-"""Verification tests: intact, sidecar healing, real damage + repair, chain."""
+﻿"""Verification tests: intact, sidecar healing, real damage + repair, chain."""
 
+import hashlib
 import os
 import re
 import shutil
@@ -93,16 +94,35 @@ def test_verify_tampered_sidecar_fails_then_fix_regenerates(job, capsys):
     full = job.full_archive()
     sidecar = full.with_name(full.name + ".sha256")
 
+    # 1) mismatch + --fix: still fails, sidecar unchanged, no backup
     sidecar.write_text("0" * 64 + " *" + full.name + "\n", encoding="utf-8")
-    assert run_cli(["verify", job.dir]) == 3
+    assert run_cli(["verify", job.dir, "--fix"]) == 3
     captured = capsys.readouterr()
     assert "sha256 mismatch" in captured.err + captured.out
+    assert sidecar.read_text(encoding="utf-8") == "0" * 64 + " *" + full.name + "\n"
+    assert list(full.parent.glob(full.name + ".sha256.bak-*")) == []
 
-    assert run_cli(["verify", job.dir, "--fix"]) == 0
+    # 2) mismatch + --accept-new-hash: succeeds, sidecar updated, backup kept
+    assert run_cli(["verify", job.dir, "--accept-new-hash"]) == 0
     m = re.fullmatch(r"([0-9a-f]{64}) \*" + re.escape(full.name) + r"\n",
-                     sidecar.read_text(encoding="utf-8"))
+                      sidecar.read_text(encoding="utf-8"))
     assert m and m.group(1) == sha256_file(full)
+    baks = list(full.parent.glob(full.name + ".sha256.bak-*"))
+    assert baks
+    assert baks[0].read_text(encoding="utf-8").split()[0] == "0" * 64
 
+    # 3) mismatch + --accept-new-hash + structural failure: fails, no regen
+    for b in full.parent.glob(full.name + ".sha256.bak-*"):
+        b.unlink()
+    sidecar.write_text("0" * 64 + " *" + full.name + "\n", encoding="utf-8")
+    import subprocess
+    subprocess.run([str(conftest.RAR_PATH), "d", "-inul", str(full), "a"],
+                   check=True)
+    assert run_cli(["verify", job.dir, "--accept-new-hash"]) == 3
+    captured = capsys.readouterr()
+    assert "sha256 mismatch" in captured.err + captured.out
+    assert sidecar.read_text(encoding="utf-8") == "0" * 64 + " *" + full.name + "\n"
+    assert list(full.parent.glob(full.name + ".sha256.bak-*")) == []
 
 def test_verify_real_damage_fails_then_fix_repairs(job, tmp_path, capsys):
     _full, diff = _make_full_and_diff(job)
@@ -199,7 +219,7 @@ def _craft_encrypted_full(rar, tmp_path, *, target, dek, recipient, signer,
         "manifest_id": str(uuid.uuid4()),
         "filename": target.name,
         "archive_type": "full",
-        "config_sha256": "0" * 64,
+        "config_sha256": hashlib.sha256(_VALID_CONFIG).hexdigest(),
         "sources": ["C:/nonexistent-source"],
         "base_full": target.name,
         "previous_manifest_id": None,
@@ -215,8 +235,11 @@ def _craft_encrypted_full(rar, tmp_path, *, target, dek, recipient, signer,
     raw_manifest = json_bytes(manifest_data)
     sig = crypto.sign_bytes(sign_priv, b"tampered bytes" if sign_bad else raw_manifest)
     if tampers_manifest:
-        assert raw_manifest.count(b"0" * 64) == 1
-        raw_manifest = raw_manifest.replace(b"0" * 64, b"1" * 64, 1)
+        # Mutate a counter value so the manifest bytes no longer match the
+        # signature (computed over the original bytes), while staying valid
+        # JSON so signature verification is the failing step.
+        assert b'"files": 1' in raw_manifest
+        raw_manifest = raw_manifest.replace(b'"files": 1', b'"files": 2', 1)
     snapshot = Snapshot(
         files=[FileEntry(fn="data.bin", sz=len(content), mt_ns=time.time_ns())],
         empty_dirs=[])

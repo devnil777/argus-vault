@@ -150,14 +150,26 @@ def resolve_epoch(job_dir: Path, name: str | None) -> Path:
 # Per-epoch archive listing
 # ---------------------------------------------------------------------------
 
+def is_repair_artifact(name: str) -> bool:
+    """True if ``name`` is a RAR repair leftover (``fixed.*``/``rebuilt.*``).
+
+    Such files are never part of the chain: they are produced by an
+    interrupted ``rar r`` and must not become the tip or block a new full.
+    """
+    return name.startswith("fixed.") or name.startswith("rebuilt.")
+
+
 def epoch_archives(epoch_dir: Path) -> list[Path]:
     """Return the ``*.rar`` archives in the epoch, sorted by filename.
 
     Only plain ``.rar`` files: ``.rar.tmp``, ``.rar.sha256`` and
-    ``.rar.log`` siblings do not match the ``*.rar`` glob.
+    ``.rar.log`` siblings do not match the ``*.rar`` glob. Repair leftovers
+    (``fixed.*``/``rebuilt.*``) are excluded so they can never become the
+    tip or block a new full/diff.
     """
     epoch_dir = Path(epoch_dir)
-    rars = [p for p in epoch_dir.glob("*.rar") if p.is_file()]
+    rars = [p for p in epoch_dir.glob("*.rar")
+            if p.is_file() and not is_repair_artifact(p.name)]
     return sorted(rars, key=lambda p: p.name)
 
 

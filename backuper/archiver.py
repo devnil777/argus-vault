@@ -48,7 +48,7 @@ from pathlib import Path
 
 from backuper import crypto, rar_runner
 from backuper.config import Config
-from backuper.errors import RarError, VerificationError
+from backuper.errors import EpochError, RarError, VerificationError
 from backuper.models import (
     ENCRYPTION_DATA,
     MANIFEST_SIGNATURE_MEMBER,
@@ -141,6 +141,7 @@ class CreateOutcome:
     duration_s: float
     counters: dict
     notes: list[str]
+    committed: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -183,31 +184,48 @@ def hash_file_with_progress(archive: Path, purpose: str, *,
         bar.finish()
 
 
-def write_sidecar(archive: Path, *, digest: str | None = None) -> tuple[bool, str]:
+def write_sidecar(archive: Path, *, digest: str | None = None,
+                  backup_existing: bool = False) -> tuple[bool, str]:
     """Write ``<archive>.sha256`` (certutil/sha256sum format) + fsync.
 
     ``digest`` lets the caller reuse a hash it already computed (no re-read).
-    Returns ``(written, digest)``. A write failure is reported, never
-    raised: per spec the archive stays valid without the sidecar.
+    ``backup_existing`` copies a pre-existing sidecar to
+    ``<sidecar>.bak-<UTC timestamp>`` before replacing it.
+    The write is atomic: data goes to ``<sidecar>.tmp``, is fsynced, then
+    renamed over the sidecar via ``os.replace``. Returns ``(written, digest)``.
+    A write failure is reported, never raised: per spec the archive stays
+    valid without the sidecar.
     """
     if digest is None:
         digest = sha256_file(archive)
     sidecar = Path(str(archive) + ".sha256")
+    tmp = Path(str(sidecar) + ".tmp")
     try:
-        with open(sidecar, "w", encoding="utf-8", newline="") as fh:
+        if backup_existing and os.path.lexists(winapi_path(sidecar)):
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            backup = Path(str(sidecar) + f".bak-{timestamp}")
+            shutil.copyfile(winapi_path(sidecar), winapi_path(backup))
+        with open(winapi_path(tmp), "w", encoding="utf-8", newline="") as fh:
             fh.write(f"{digest} *{archive.name}\n")
             fh.flush()
             os.fsync(fh.fileno())
+        os.replace(winapi_path(tmp), winapi_path(sidecar))
     except OSError:
+        try:
+            if os.path.lexists(winapi_path(tmp)):
+                os.remove(winapi_path(tmp))
+        except OSError:
+            pass
         return False, digest
     return True, digest
 
 
-def write_sidecar_with_progress(archive: Path) -> tuple[bool, str]:
+def write_sidecar_with_progress(archive: Path, *, digest: str | None = None,
+                                backup_existing: bool = False) -> tuple[bool, str]:
     """Hash with console progress, then write <archive>.sha256 (no re-read)."""
-    digest = hash_file_with_progress(archive, "the sha256 sidecar", label="sha256 sidecar")
-    written, _ = write_sidecar(archive, digest=digest)
-    return written, digest
+    if digest is None:
+        digest = hash_file_with_progress(archive, "the sha256 sidecar", label="sha256 sidecar")
+    return write_sidecar(archive, digest=digest, backup_existing=backup_existing)
 
 
 def read_sidecar_hash(archive: Path) -> str | None:
@@ -474,6 +492,10 @@ def create_archive(runner: RarRunner, spec: CreateSpec, *, progress: bool) -> Cr
         # surfaces as a rar write error -> failed run (policy handles it).
         print(f"warning: {problem}", file=sys.stderr, flush=True)
 
+    # Hardening (stage 1.4): never silently overwrite an existing target.
+    if os.path.lexists(winapi_path(target)):
+        raise EpochError(f"target archive already exists: {target}")
+
     staging = Path(tempfile.mkdtemp(prefix="backuper_svc_"))
     try:
         # --- stage the service members ------------------------------------
@@ -574,6 +596,8 @@ def create_archive(runner: RarRunner, spec: CreateSpec, *, progress: bool) -> Cr
                     "post-archive cross-check failed:\n"
                     + "\n".join(f"  - {p}" for p in problems))
 
+            if os.path.lexists(winapi_path(target)):
+                raise EpochError(f"target archive already exists: {target}")
             os.replace(tmp, target)
         except BaseException:
             # failure or interrupt: never leave a half-written archive behind
@@ -586,28 +610,43 @@ def create_archive(runner: RarRunner, spec: CreateSpec, *, progress: bool) -> Cr
     finally:
         shutil.rmtree(winapi_path(staging), ignore_errors=True)
 
-    # --- sidecar (failure is a warning, the archive stays valid) ----------
-    sidecar_written, digest = write_sidecar_with_progress(target)
-    if not sidecar_written:
-        note = f"sha256 sidecar could not be written: {target.name}.sha256"
+    # --- committed boundary: the archive is valid from here on --------------
+    committed = True
+
+    # --- sidecar (best-effort: failure never invalidates the archive) ------
+    sidecar_written = False
+    digest: str | None = None
+    try:
+        sidecar_written, digest = write_sidecar_with_progress(target)
+        if not sidecar_written:
+            note = f"sha256 sidecar could not be written: {target.name}.sha256"
+            notes.append(note)
+            print(f"warning: {note}", file=sys.stderr)
+    except (OSError, KeyboardInterrupt) as exc:
+        note = f"post-commit: sidecar not written ({exc})"
         notes.append(note)
         print(f"warning: {note}", file=sys.stderr)
 
     duration_s = time.monotonic() - started_monotonic
     finished_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    _write_success_log(
-        target=target,
-        spec=spec,
-        step_results=step_results,
-        content_skipped=not content_names,
-        started_utc=started_utc,
-        finished_utc=finished_utc,
-        duration_s=duration_s,
-        digest=digest,
-        notes=notes,
-        password=password,
-    )
+    try:
+        _write_success_log(
+            target=target,
+            spec=spec,
+            step_results=step_results,
+            content_skipped=not content_names,
+            started_utc=started_utc,
+            finished_utc=finished_utc,
+            duration_s=duration_s,
+            digest=digest,
+            notes=notes,
+            password=password,
+        )
+    except (OSError, KeyboardInterrupt) as exc:
+        note = f"post-commit: success log not written ({exc})"
+        notes.append(note)
+        print(f"warning: {note}", file=sys.stderr)
 
     return CreateOutcome(
         archive=target,
@@ -615,6 +654,7 @@ def create_archive(runner: RarRunner, spec: CreateSpec, *, progress: bool) -> Cr
         duration_s=duration_s,
         counters=dict(spec.manifest.counters),
         notes=notes,
+        committed=committed,
     )
 
 
@@ -631,7 +671,7 @@ def _write_success_log(
     started_utc: str,
     finished_utc: str,
     duration_s: float,
-    digest: str,
+    digest: str | None,
     notes: list[str],
     password: bytes | None = None,
 ) -> None:
@@ -672,7 +712,7 @@ def _write_success_log(
         "",
         "counters         : "
         + ", ".join(f"{k}={v}" for k, v in sorted(counters.items())),
-        f"sha256           : {digest}",
+        f"sha256           : {digest if digest is not None else '(not computed)'}",
     ]
     lines.append("")
     lines.append("rar commands:")

@@ -35,6 +35,7 @@ previous archive's snapshot (``compute_diff``) and passes it in.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
@@ -60,7 +61,7 @@ from backuper.models import (
     Snapshot,
 )
 from backuper.progress import PercentProgress, fmt_duration
-from backuper.rar_runner import RarRunner, read_service_member
+from backuper.rar_runner import RarRunner, read_service_member, winapi_path
 from backuper.scanner import leaves
 
 # The manifest member whose detached signature is checked for encrypted
@@ -181,6 +182,7 @@ def verify_archive(
     archive: Path,
     *,
     fix: bool,
+    accept_new_hash: bool = False,
     expected_files: dict[str, int] | None = None,
     recipient_private_pem: bytes | None = None,
     trusted_signing_pem: bytes | None = None,
@@ -246,6 +248,7 @@ def verify_archive(
     sidecar = Path(str(report.archive) + ".sha256")
     sidecar_missing = not sidecar.is_file()
     sha_mismatch = False
+    actual_digest: str | None = None
     if sidecar_missing:
         report.notes.append("sha256 sidecar is missing (archive can still be valid)")
     else:
@@ -253,11 +256,14 @@ def verify_archive(
         if expected_hash is None:
             report.notes.append("sha256 sidecar is malformed")
             sha_mismatch = True
+            actual_digest = hash_file_with_progress(
+                report.archive, "the sha256 check", label="sha256 check")
         else:
             actual = hash_file_with_progress(
                 report.archive, "the sha256 check", label="sha256 check")
             if actual != expected_hash:
                 sha_mismatch = True
+                actual_digest = actual
 
     # 4. listing (once; feeds both the rar t indicator and the check) --------
     entries = _list_archive(runner, report.archive)
@@ -265,6 +271,7 @@ def verify_archive(
         report.ok = False
         return report
 
+    skip_structure = False
     # 5. rar t --------------------------------------------------------------
     total_files, cum_bytes, total_bytes = _test_totals(entries)
     print(f"testing {report.archive.name} ...", flush=True)
@@ -283,11 +290,78 @@ def verify_archive(
             report.ok = False
             return report
         ok, repaired, notes, problems = repair_flow(
-            runner, report.archive, password=rar_password)
+            runner, report.archive, password=rar_password,
+            trusted_signing_pem=trusted_signing_pem,
+            require_signature=(manifest.encryption == ENCRYPTION_DATA),
+            recipient_private_pem=recipient_private_pem,
+            recipient_key_id=recipient_key_id,
+            expected_files=expected_files)
         report.repaired = repaired
         report.notes.extend(notes)
         if not ok:
             report.problems.extend(problems)
+            report.ok = False
+            return report
+        # successful repair rewrote archive + sidecar: re-read metadata,
+        # listing and re-run structural checks on the replaced archive so
+        # the report never reflects stale pre-repair data.
+        post_ok = True
+        post_problems: list[str] = []
+        require_sig = (manifest.encryption == ENCRYPTION_DATA)
+        new_manifest: Manifest | None = None
+        new_snapshot: Snapshot | None = None
+        try:
+            new_manifest = chain.load_manifest(
+                runner, report.archive,
+                trusted_signing_pem=trusted_signing_pem,
+                require_signature=require_sig)
+            new_snapshot = chain.load_snapshot(runner, report.archive)
+        except EpochError as exc:
+            post_ok = False
+            post_problems.append(
+                f"repaired archive metadata unreadable: {exc}")
+        if (post_ok and new_manifest is not None and new_snapshot is not None
+                and new_manifest.encryption == ENCRYPTION_DATA):
+            _, unlock_problem = _unlock_encrypted_manifest(
+                runner, report.archive, new_manifest,
+                trusted_signing_pem=trusted_signing_pem,
+                recipient_private_pem=recipient_private_pem,
+                recipient_key_id=recipient_key_id)
+            if unlock_problem is not None:
+                post_ok = False
+                post_problems.append(unlock_problem)
+        new_entries = None
+        if post_ok:
+            new_entries = _list_archive(runner, report.archive)
+            if new_entries is None:
+                post_ok = False
+                post_problems.append("listing of the repaired archive failed")
+        if post_ok and new_manifest is not None and new_snapshot is not None and new_entries is not None:
+            if new_manifest.archive_type == "full":
+                post_expectation: dict[str, int] | None = {
+                    e.fn: e.sz for e in new_snapshot.files if not e.skipped}
+            else:
+                post_expectation = expected_files
+            post_problems += _structural_check(
+                runner, report.archive, new_manifest, new_snapshot,
+                post_expectation, new_entries)
+            if post_problems:
+                post_ok = False
+        if post_ok and new_manifest is not None and new_snapshot is not None and new_entries is not None:
+            manifest = new_manifest
+            snapshot = new_snapshot
+            entries = new_entries
+            report.manifest = manifest
+            report.snapshot = snapshot
+            sha_mismatch = False
+            sidecar_missing = False
+            skip_structure = True
+        else:
+            report.problems.extend(post_problems)
+            report.problems.append(
+                "repaired archive failed post-repair verification")
+            report.notes.append(
+                "repaired archive failed post-repair verification")
             report.ok = False
             return report
     elif t_exit != 0:
@@ -301,37 +375,64 @@ def verify_archive(
         report.ok = False
         return report
     elif sha_mismatch:
-        if not fix:
-            report.problems.append(
-                "sha256 mismatch: archive content differs from its sidecar")
-            report.ok = False
-            # the archive passed rar t, so also show the structural result
-        else:
-            # internally CRC-valid -> the sidecar is what drifted; regenerate
-            write_sidecar_with_progress(report.archive)
-            report.notes.append(
-                "sha256 sidecar regenerated (archive passed integrity test "
-                "but content differed from sidecar)")
+        report.problems.append(
+            "sha256 mismatch: archive content differs from its sidecar")
+        report.ok = False
+        # the archive passed rar t, so also show the structural result
 
     # 6. structure ----------------------------------------------------------
-    if manifest.archive_type == "full":
-        expectation: dict[str, int] | None = {
-            e.fn: e.sz for e in snapshot.files if not e.skipped}
-    else:
-        expectation = expected_files
-    problems = _structural_check(
-        runner, report.archive, manifest, snapshot, expectation, entries)
-    if problems:
-        report.problems.extend(problems)
-        report.ok = False
-        return report
+    if not skip_structure:
+        if manifest.archive_type == "full":
+            expectation: dict[str, int] | None = {
+                e.fn: e.sz for e in snapshot.files if not e.skipped}
+        else:
+            expectation = expected_files
+        problems = _structural_check(
+            runner, report.archive, manifest, snapshot, expectation, entries)
+        if problems:
+            report.problems.extend(problems)
+            report.ok = False
+            return report
 
     # 7. self-heal a missing sidecar ------------------------------------------
     if sidecar_missing:
-        write_sidecar_with_progress(report.archive)
+        written, _ = write_sidecar_with_progress(report.archive)
+        if not written:
+            report.problems.append(
+                "sha256 sidecar could not be written after successful "
+                "verification")
+            report.ok = False
+            return report
         report.notes.append(
             "sha256 sidecar was missing and has been regenerated after "
             "successful verification")
+
+    # 8. regenerate a mismatched sidecar only when explicitly accepted -------
+    if sha_mismatch:
+        if accept_new_hash:
+            written, _ = write_sidecar_with_progress(
+                report.archive, digest=actual_digest, backup_existing=True)
+            if not written:
+                report.problems.append(
+                    "sha256 sidecar could not be regenerated after successful "
+                    "verification")
+                report.ok = False
+                return report
+            report.notes.append(
+                "sha256 sidecar regenerated (archive passed structural checks; "
+                "new hash accepted)")
+            # resolve the deferred mismatch problem recorded earlier
+            report.problems = [
+                p for p in report.problems
+                if "sha256 mismatch: archive content differs from its sidecar"
+                not in p]
+            report.ok = True
+        else:
+            if not any("sha256 mismatch" in p for p in report.problems):
+                report.problems.append(
+                    "sha256 mismatch: archive content differs from its sidecar")
+            report.ok = False
+            return report
     return report
 
 
@@ -459,6 +560,14 @@ def _structural_check(
     if problems:
         return problems
 
+    expected_config_sha = manifest.config_sha256
+    actual_config_sha = hashlib.sha256(
+        svc_bytes[".backup/config.yaml"]).hexdigest()
+    if expected_config_sha != actual_config_sha:
+        problems.append(
+            f"manifest config_sha256={expected_config_sha} does not match "
+            f"the embedded .backup/config.yaml (actual {actual_config_sha})")
+
     files, folders, split_problems = split_entries(entries)
     problems.extend(split_problems)
 
@@ -516,6 +625,11 @@ def repair_flow(
     archive: Path,
     *,
     password: bytes | None = None,
+    trusted_signing_pem: bytes | None = None,
+    require_signature: bool = False,
+    recipient_private_pem: bytes | None = None,
+    recipient_key_id: str | None = None,
+    expected_files: dict[str, int] | None = None,
 ) -> tuple[bool, bool, list[str], list[str]]:
     """Repair ``archive`` via its recovery record.
 
@@ -573,19 +687,37 @@ def repair_flow(
     manifest: Manifest | None = None
     snapshot: Snapshot | None = None
     try:
-        manifest = chain.load_manifest(runner, fixed)
+        manifest = chain.load_manifest(
+            runner, fixed,
+            trusted_signing_pem=trusted_signing_pem,
+            require_signature=require_signature)
         snapshot = chain.load_snapshot(runner, fixed)
     except EpochError as exc:
         problems.append(f"repaired copy metadata unreadable: {exc}")
         ok = False
     if ok and fixed_entries is not None and manifest is not None and snapshot is not None:
-        expectation = None
-        if manifest.archive_type == "full":
-            expectation = {e.fn: e.sz for e in snapshot.files if not e.skipped}
-        problems += _structural_check(
-            runner, fixed, manifest, snapshot, expectation, fixed_entries)
-        if problems:
-            ok = False
+        # Encrypted manifests: verify signature (already done by
+        # load_manifest above) and unlock the DEK on the repaired copy
+        # before any structural check.
+        if manifest.encryption == ENCRYPTION_DATA:
+            _, unlock_problem = _unlock_encrypted_manifest(
+                runner, fixed, manifest,
+                trusted_signing_pem=trusted_signing_pem,
+                recipient_private_pem=recipient_private_pem,
+                recipient_key_id=recipient_key_id)
+            if unlock_problem is not None:
+                problems.append(unlock_problem)
+                ok = False
+        if ok:
+            expectation = None
+            if manifest.archive_type == "full":
+                expectation = {e.fn: e.sz for e in snapshot.files if not e.skipped}
+            elif expected_files is not None:
+                expectation = expected_files
+            problems += _structural_check(
+                runner, fixed, manifest, snapshot, expectation, fixed_entries)
+            if problems:
+                ok = False
 
     if not ok:
         try:
@@ -595,10 +727,13 @@ def repair_flow(
         _repair_leftovers(archive)
         return False, False, notes, problems
 
-    os.replace(fixed, archive)
+    os.replace(winapi_path(fixed), winapi_path(archive))
     _repair_leftovers(archive)  # e.g. a rebuilt.<name> from an earlier salvage
-    write_sidecar_with_progress(archive)
-    notes.append("repaired via recovery record; sidecar updated")
+    written, _ = write_sidecar_with_progress(archive, backup_existing=True)
+    if written:
+        notes.append("repaired via recovery record; sidecar updated")
+    else:
+        notes.append("repaired via recovery record; sidecar write failed")
     return True, True, notes, problems
 
 
@@ -611,6 +746,7 @@ def verify_chain(
     epoch_dir: Path,
     *,
     fix: bool,
+    accept_new_hash: bool = False,
     recipient_private_pem: bytes | None = None,
     trusted_signing_pem: bytes | None = None,
     recipient_key_id: str | None = None,
@@ -676,7 +812,8 @@ def verify_chain(
     reports: list[VerifyReport] = []
     for archive in archives:
         report = verify_archive(
-            runner, archive, fix=fix, expected_files=expectations.get(archive.name),
+            runner, archive, fix=fix, accept_new_hash=accept_new_hash,
+            expected_files=expectations.get(archive.name),
             recipient_private_pem=recipient_private_pem,
             trusted_signing_pem=trusted_signing_pem,
             recipient_key_id=recipient_key_id)

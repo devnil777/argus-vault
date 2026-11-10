@@ -153,3 +153,31 @@ def test_is_no_op():
     assert not compute_diff(prev, snap([], empty_dirs=["n"])).is_no_op
     d = compute_diff(prev, snap([]))
     assert not d.is_no_op and d.deleted_files == ["a"]
+
+
+# --- stage 1.1: new skipped files must not enter the diff --------------------
+
+def test_new_skipped_not_added_not_deleted():
+    prev = snap([F("a.txt", 1, 1)])
+    cur = snap([F("a.txt", 1, 1), F("locked.pst", 10, 200, skipped=True)])
+    d = compute_diff(prev, cur)
+    assert d.added == []
+    assert d.deleted_files == []
+    assert d.is_no_op
+
+
+def test_new_skipped_with_other_changes_excluded_from_added():
+    prev = snap([F("a.txt", 1, 1)])
+    cur = snap([F("a.txt", 2, 2), F("locked.pst", 10, 200, skipped=True)])
+    d = compute_diff(prev, cur)
+    assert d.added == ["a.txt"]
+    assert "locked.pst" not in d.added
+    assert not d.is_no_op
+
+
+def test_new_skipped_alone_is_no_op():
+    prev = snap([F("a.txt", 1, 1)])
+    cur = snap([F("a.txt", 1, 1), F("newlocked.pst", 5, 5, skipped=True)])
+    d = compute_diff(prev, cur)
+    assert d.added == []
+    assert d.is_no_op

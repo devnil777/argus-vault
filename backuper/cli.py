@@ -6,7 +6,7 @@ Commands are flat sub-commands of a single entry point::
     python -m backuper keygen  <dir> [--force]
     python -m backuper full    [<dir>] [--rar PATH] [--signing-private-key PATH]
     python -m backuper diff    [<dir>] [--epoch NAME] [--rar PATH] [--signing-private-key PATH]
-    python -m backuper verify  [<dir>] [--epoch NAME] [--chain] [--fix] [--rar PATH]
+    python -m backuper verify  [<dir>] [--epoch NAME] [--chain] [--fix] [--accept-new-hash] [--rar PATH]
                               [--recipient-private-key PATH]
     python -m backuper list    [<dir>] [--rar PATH]
     python -m backuper password <archive.rar> [--keys-dir PATH] [--rar PATH] [--recipient-private-key PATH]
@@ -110,8 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--chain", action="store_true",
                         help="verify every archive of the epoch incl. chain linkage")
     verify.add_argument("--fix", action="store_true",
-                        help="repair damaged archives via the recovery record and "
-                             "regenerate drifted sidecars")
+                        help="repair damaged archives via the recovery record")
+    verify.add_argument("--accept-new-hash", action="store_true",
+                        help="accept a changed archive hash and regenerate its "
+                             "sha256 sidecar (with .bak backup) after all "
+                             "structural checks pass")
     verify.add_argument("--recipient-private-key", metavar="PATH", default=None,
                         help="path to recipient_private.pem")
     lst = sub.add_parser("list", help="list epochs and their archives")
@@ -254,7 +257,8 @@ def _run_command(args: argparse.Namespace) -> int:
         if args.command == "verify":
             from backuper import runner  # noqa: PLC0415
             return runner.cmd_verify(
-                args.dir, args.epoch, chain_mode=args.chain, fix=args.fix, rar_path=args.rar,
+                args.dir, args.epoch, chain_mode=args.chain, fix=args.fix,
+                accept_new_hash=args.accept_new_hash, rar_path=args.rar,
                 recipient_private_key_path=args.recipient_private_key)
         if args.command == "list":
             from backuper import runner  # noqa: PLC0415

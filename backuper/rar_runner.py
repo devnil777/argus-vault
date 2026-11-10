@@ -9,7 +9,7 @@ Canonical invocation forms (validated empirically against Rar.exe 7.22,
 see DIAGNOSTICS.md; the TRIAL build prints a two-line banner before every
 output — strip_rar_banner removes it):
 
-    Rar.exe a -y -scflr -os -m<N> [-qo+ -rr5] -w<archive dir> <target> @<listfile>
+    Rar.exe a -y -scflr -os -r- -m<N> [-qo+ -rr5] -w<archive dir> <target> @<listfile>
         create step (create_step). Listfile: UTF-8 (no BOM), CRLF,
         relative names with backslashes, dirs WITHOUT trailing separator
         ('dir\\' is silently ignored by RAR).
@@ -722,7 +722,14 @@ def create_step(
         normalized = [n.replace("/", "\\").rstrip("\\") for n in names]
         write_list_file(list_path, normalized, bom=bom)
         pw_args, stdin_payload = _rar_password_stdin(password)
-        args = ["a", "-y", "-scflr", "-os", f"-m{compression}"]
+        # -r- disables recursion: an explicitly named directory (e.g. one of
+        # the leaf empty dirs passed in names) is stored as a folder entry
+        # only, without RAR pulling in its on-disk contents. Without it, RAR
+        # archives the whole subtree of such a dir (including excluded
+        # extensions, excluded dirs like .git, and junction/symlink targets),
+        # which both violates the scanner's exclusion policy and breaks the
+        # post-archive cross-check.
+        args = ["a", "-y", "-scflr", "-os", "-r-", f"-m{compression}"]
         if final:
             args += ["-qo+", "-rr5"]
         args += pw_args
